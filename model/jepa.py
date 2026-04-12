@@ -2,7 +2,8 @@
 JEPA (Joint Embedding Predictive Architecture) for grid-based self-driving.
 
 Replaces the ViT encoder from le-wm with a lightweight CNN encoder
-since our observations are tiny grids (16 x 10, single channel).
+since our observations are tiny grids (6 x 6 local FOV, single channel).
+Action conditioning includes action (2D) + goal_dir (2D) = 4D.
 """
 
 import torch
@@ -21,10 +22,10 @@ class GridEncoder(nn.Module):
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((4, 4)),  # -> (64, 4, 4) = 1024
+            nn.AdaptiveAvgPool2d((3, 3)),  # -> (64, 3, 3) = 576
         )
         self.fc = nn.Sequential(
-            nn.Linear(64 * 4 * 4, embed_dim),
+            nn.Linear(64 * 3 * 3, embed_dim),
             nn.ReLU(),
         )
 

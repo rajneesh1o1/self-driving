@@ -12,6 +12,7 @@ Model sees: a small grid (FOV_H x FOV_W) — the car's field of view.
 The world is generated in chunks on demand — no boundaries.
 """
 
+import heapq
 import math
 import numpy as np
 
@@ -24,6 +25,10 @@ FOV_W = 16
 
 # ---------- Car ----------
 CAR_SIZE = 2
+
+# ---------- Visibility (what the car can sense) ----------
+VISIBILITY = 2                              # cells from car outline
+LOCAL_FOV = 2 * VISIBILITY + CAR_SIZE       # 6x6
 
 # ---------- Visual rendering ----------
 CELL_SIZE = 40
@@ -118,8 +123,31 @@ class CarGame:
     #  Representations
     # ================================================================
 
+    def get_local_fov(self):
+        """What the car can actually see: (LOCAL_FOV, LOCAL_FOV) grid.
+
+        Car outline + VISIBILITY cells in every direction.
+        Values:  1.0 = car,  -1.0 = obstacle,  0.0 = empty.
+        Car is always at the centre (rows/cols VISIBILITY..VISIBILITY+CAR_SIZE-1).
+        """
+        size = LOCAL_FOV
+        grid = np.zeros((size, size), dtype=np.float32)
+        top = self.car_y - VISIBILITY
+        left = self.car_x - VISIBILITY
+
+        for r in range(size):
+            for c in range(size):
+                if self.world_val(top + r, left + c) < -0.5:
+                    grid[r, c] = -1.0
+
+        for dr in range(CAR_SIZE):
+            for dc in range(CAR_SIZE):
+                grid[VISIBILITY + dr, VISIBILITY + dc] = 1.0
+
+        return grid
+
     def get_grid(self):
-        """FOV grid centred on the car.  Shape (FOV_H, FOV_W), float32."""
+        """Full render FOV grid centred on the car.  Shape (FOV_H, FOV_W)."""
         fov_top = self.car_y + CAR_SIZE // 2 - FOV_H // 2
         fov_left = self.car_x + CAR_SIZE // 2 - FOV_W // 2
 
@@ -184,7 +212,7 @@ class CarGame:
 
         # ── corridor cells (keep clear) ──
         corridor = set()
-        corr_w = CAR_SIZE + 3
+        corr_w = CAR_SIZE + 2          # tighter corridor (was +3)
         for ly in range(CHUNK_SIZE):
             center = self._corridor_center_x(base_y + ly)
             for dx in range(corr_w):
@@ -193,7 +221,7 @@ class CarGame:
                     corridor.add((ly, lx))
 
         # ── scatter obstacles ──
-        n_obs = int(CHUNK_SIZE * CHUNK_SIZE * 0.04)
+        n_obs = int(CHUNK_SIZE * CHUNK_SIZE * 0.04)   # denser (was 0.04)
         for _ in range(n_obs):
             oh, ow = _OBS_SIZES[int(rng.integers(0, len(_OBS_SIZES)))]
             oy = int(rng.integers(0, CHUNK_SIZE))
@@ -309,7 +337,7 @@ def noisy_expert_action(game):
 
 
 # ================================================================
-#  DFS Navigator — goal-directed with backtracking
+#  Navigator — limited-visibility A* (fog of war)
 # ================================================================
 
 def _dir_to_action(dx, dy):
@@ -320,22 +348,28 @@ def _dir_to_action(dx, dy):
 
 class DFSNavigator:
     """
-    Goal-directed DFS pathfinding with backtracking.
+    Limited-visibility navigator.
 
-    Explores greedily: among passable neighbours, picks the one whose
-    move vector best points toward the destination (minimum Euclidean
-    distance to goal after the move).  When every neighbour is visited
-    or blocked, backtracks along the DFS path and retries from the
-    previous junction.
+    The car only knows:
+      • its own coordinates
+      • the goal coordinates
+      • cells within VISIBILITY of its outline (revealed as it moves)
+
+    Each step the car reveals its local area, then plans a path with
+    A* over what it has seen so far.  Unknown cells are assumed clear.
+    When new obstacles are discovered on the planned path the car
+    replans automatically.  It never has global map knowledge.
     """
 
     def __init__(self, goal_y=-50, goal_x=0):
         self.goal_y = goal_y
         self.goal_x = goal_x
-        self.visited = set()
-        self.stack = []              # DFS path: start → current
+        self._known = {}          # (y,x) → bool  (True = obstacle)
+        self._plan = []           # solution path (excl. start)
+        self._step = 0
+        self._explored = set()    # last A* closed set
+        self._trail = []          # positions the car has been
         self.reached = False
-        self._backtracking = False
 
     # ── lifecycle ──────────────────────────────────────────────
 
@@ -344,79 +378,161 @@ class DFSNavigator:
             self.goal_y = goal_y
         if goal_x is not None:
             self.goal_x = goal_x
-        self.visited = {(start_y, start_x)}
-        self.stack = [(start_y, start_x)]
+        self._known = {}
+        self._plan = []
+        self._step = 0
+        self._explored = set()
+        self._trail = []
         self.reached = False
-        self._backtracking = False
 
     # ── main step ─────────────────────────────────────────────
 
     def next_action(self, game):
-        """Return (action_x, action_y) for the next step."""
         cur = (game.car_y, game.car_x)
 
-        # initialise / sync with actual car position
-        if not self.stack:
-            self.stack.append(cur)
-            self.visited.add(cur)
-        if self.stack[-1] != cur:
-            self.visited.add(cur)
-            self.stack.append(cur)
+        # record where the car has been
+        if not self._trail or self._trail[-1] != cur:
+            self._trail.append(cur)
 
-        # check goal
         if abs(cur[0] - self.goal_y) <= 1 and abs(cur[1] - self.goal_x) <= 1:
             self.reached = True
             return 0.0, 0.0
 
-        # ── collect unvisited, passable neighbours ──
-        neighbours = []
-        for dy in [-1, 0, 1]:
-            for dx in [-1, 0, 1]:
-                if dy == 0 and dx == 0:
-                    continue
-                ny, nx = cur[0] + dy, cur[1] + dx
-                if (ny, nx) in self.visited:
-                    continue
-                if game._collides(ny, nx):
-                    self.visited.add((ny, nx))   # don't recheck
-                    continue
-                # Euclidean distance to goal after the move
-                dist = math.sqrt((ny - self.goal_y) ** 2 +
-                                 (nx - self.goal_x) ** 2)
-                neighbours.append((dist, dy, dx))
+        # 1. reveal local area (the only world access)
+        self._reveal(game)
 
-        # ── move toward goal (greedy DFS) ──
-        if neighbours:
-            self._backtracking = False
-            neighbours.sort()
-            _, dy, dx = neighbours[0]
-            ny, nx = cur[0] + dy, cur[1] + dx
-            self.visited.add((ny, nx))
-            self.stack.append((ny, nx))
-            return _dir_to_action(dx, dy)
+        # 2. replan when needed
+        if self._needs_replan(cur):
+            self._plan = self._astar(cur)
+            self._step = 0
 
-        # ── dead end → backtrack ──
-        if len(self.stack) > 1:
-            self._backtracking = True
-            self.stack.pop()
-            prev = self.stack[-1]
-            dy = prev[0] - cur[0]
-            dx = prev[1] - cur[1]
-            return _dir_to_action(dx, dy)
+        if not self._plan or self._step >= len(self._plan):
+            return 0.0, 0.0
 
-        # stuck at start (shouldn't happen with corridors)
-        return 0.0, 0.0
+        # 3. skip past current position
+        while (self._step < len(self._plan)
+               and self._plan[self._step] == cur):
+            self._step += 1
+        if self._step >= len(self._plan):
+            return 0.0, 0.0
+
+        # 4. move one step along the plan
+        nxt = self._plan[self._step]
+        return _dir_to_action(nxt[1] - cur[1], nxt[0] - cur[0])
+
+    # ── perception ────────────────────────────────────────────
+
+    def _reveal(self, game):
+        """Reveal cells within VISIBILITY of the car outline."""
+        cy, cx = game.car_y, game.car_x
+        for dy in range(-VISIBILITY, CAR_SIZE + VISIBILITY):
+            for dx in range(-VISIBILITY, CAR_SIZE + VISIBILITY):
+                cell = (cy + dy, cx + dx)
+                if cell not in self._known:
+                    self._known[cell] = (
+                        game.world_val(cell[0], cell[1]) < -0.5
+                    )
+
+    # ── collision using known map only ────────────────────────
+
+    def _is_blocked(self, y, x):
+        """Would the 2×2 car collide with a *known* obstacle here?
+        Unknown cells are assumed clear (optimistic)."""
+        for dr in range(CAR_SIZE):
+            for dc in range(CAR_SIZE):
+                if self._known.get((y + dr, x + dc), False):
+                    return True
+        return False
+
+    # ── A* on the known map ───────────────────────────────────
+
+    def _astar(self, start):
+        goal = (self.goal_y, self.goal_x)
+        open_heap = []
+        counter = 0
+        heapq.heappush(open_heap, (self._h(start, goal), counter, start))
+        came_from = {}
+        g = {start: 0.0}
+        closed = set()
+
+        while open_heap:
+            _, _, cur = heapq.heappop(open_heap)
+            if cur in closed:
+                continue
+            closed.add(cur)
+
+            cy, cx = cur
+            if abs(cy - goal[0]) <= 1 and abs(cx - goal[1]) <= 1:
+                self._explored = closed
+                return self._reconstruct(came_from, cur)[1:]
+
+            for dy in [-1, 0, 1]:
+                for dx in [-1, 0, 1]:
+                    if dy == 0 and dx == 0:
+                        continue
+                    nb = (cy + dy, cx + dx)
+                    if nb in closed:
+                        continue
+                    if self._is_blocked(nb[0], nb[1]):
+                        closed.add(nb)
+                        continue
+                    cost = 1.414 if (dy != 0 and dx != 0) else 1.0
+                    ng = g[cur] + cost
+                    if ng < g.get(nb, float('inf')):
+                        g[nb] = ng
+                        came_from[nb] = cur
+                        counter += 1
+                        heapq.heappush(open_heap, (
+                            ng + self._h(nb, goal), counter, nb))
+
+            if len(closed) > 50000:
+                break
+
+        self._explored = closed
+        return []
+
+    # ── helpers ────────────────────────────────────────────────
+
+    def _needs_replan(self, cur):
+        if not self._plan or self._step >= len(self._plan):
+            return True
+        nxt = self._plan[self._step]
+        if abs(nxt[0] - cur[0]) > 1 or abs(nxt[1] - cur[1]) > 1:
+            return True                       # off-track
+        # any newly-discovered obstacle on the remaining path?
+        for i in range(self._step, len(self._plan)):
+            if self._is_blocked(*self._plan[i]):
+                return True
+        return False
+
+    @staticmethod
+    def _reconstruct(came_from, end):
+        path = [end]
+        while end in came_from:
+            end = came_from[end]
+            path.append(end)
+        path.reverse()
+        return path
+
+    @staticmethod
+    def _h(a, b):
+        return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
 
     # ── read-only state ───────────────────────────────────────
 
     @property
     def is_backtracking(self):
-        return self._backtracking
+        return False
 
     @property
     def path(self):
-        """Current DFS path from start to car position."""
-        return list(self.stack)
+        """Cells the car has actually travelled through."""
+        return list(self._trail)
+
+    @property
+    def visited(self):
+        """Cells the car has actually seen (revealed clear cells)."""
+        return {c for c, obs in self._known.items() if not obs}
 
 
 # ================================================================

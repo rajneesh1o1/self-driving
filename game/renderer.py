@@ -234,12 +234,13 @@ class GameRenderer:
 
     def draw_grid_preview(self, screen, grid, x, y, scale=4):
         """Tiny overlay showing what the model sees."""
+        rows, cols = grid.shape[:2]
         # background
-        bg = pygame.Rect(x - 2, y - 2, FOV_W * scale + 4, FOV_H * scale + 4)
+        bg = pygame.Rect(x - 2, y - 2, cols * scale + 4, rows * scale + 4)
         pygame.draw.rect(screen, (20, 20, 20), bg, border_radius=3)
 
-        for r in range(FOV_H):
-            for c in range(FOV_W):
+        for r in range(rows):
+            for c in range(cols):
                 val = grid[r, c]
                 if val > 0.5:
                     color = (0, 255, 100)

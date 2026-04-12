@@ -1,0 +1,12 @@
+model
+
+cd /Users/rajneesh/Desktop/my_projects/laworldmodel && source venv/bin/activate && cd self-driving && python drive.py --checkpoint model/checkpoints/driving_jepa_epoch_30.pt 2>&1 &
+sleep 12 && kill %1 2>/dev/null; wait 2>/dev/null; echo "--- done ---"
+
+
+run model & A* 
+cd /Users/rajneesh/Desktop/my_projects/laworldmodel && source venv/bin/activate && cd self-driving && python drive.py --checkpoint model/checkpoints/driving_jepa_epoch_30.pt --expert-compare 2>&1 &
+PID=$!; sleep 30 && kill $PID 2>/dev/null; wait $PID 2>/dev/null; echo "--- done ---"
+
+
+cd /Users/rajneesh/Desktop/my_projects/laworldmodel && source venv/bin/activate && cd self-driving && timeout 30 python drive.py --checkpoint model/checkpoints/driving_jepa_epoch_30.pt --expert-compare 2>&1; echo "--- exit code: $? ---"

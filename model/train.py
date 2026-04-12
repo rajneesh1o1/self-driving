@@ -24,12 +24,13 @@ from jepa import GridEncoder, JEPA
 # ---------- dataset ----------
 
 class DrivingDataset(Dataset):
-    """Loads sequences of (grid, action) from HDF5."""
+    """Loads sequences of (fov, action, goal_dir) from HDF5."""
 
     def __init__(self, h5_path, seq_len):
         with h5py.File(h5_path, "r") as f:
-            self.grids = f["grid"][:]      # (N, H, W) float32
-            self.actions = f["action"][:]  # (N, 1)    float32
+            self.fovs = f["fov"][:]          # (N, 6, 6) float32
+            self.actions = f["action"][:]    # (N, 2)    float32
+            self.goal_dirs = f["goal_dir"][:] # (N, 2)  float32
             ep_len = f["ep_len"][:]
             ep_offset = f["ep_offset"][:]
 
@@ -47,9 +48,11 @@ class DrivingDataset(Dataset):
     def __getitem__(self, idx):
         s = self.indices[idx]
         e = s + self.seq_len
+        # concat action (2D) + goal_dir (2D) → 4D conditioning vector
+        cond = np.concatenate([self.actions[s:e], self.goal_dirs[s:e]], axis=-1)
         return {
-            "grid": torch.from_numpy(self.grids[s:e]).float(),
-            "action": torch.from_numpy(self.actions[s:e]).float(),
+            "grid": torch.from_numpy(self.fovs[s:e]).float(),
+            "action": torch.from_numpy(cond).float(),
         }
 
 
@@ -204,10 +207,10 @@ if __name__ == "__main__":
     parser.add_argument("--data", type=str, default="../game/driving_data.h5")
     parser.add_argument("--seed", type=int, default=42)
 
-    # grid dimensions (must match game)
-    parser.add_argument("--grid_h", type=int, default=16)
-    parser.add_argument("--grid_w", type=int, default=16)
-    parser.add_argument("--action_dim", type=int, default=2)
+    # grid dimensions (must match game: LOCAL_FOV = 6)
+    parser.add_argument("--grid_h", type=int, default=6)
+    parser.add_argument("--grid_w", type=int, default=6)
+    parser.add_argument("--action_dim", type=int, default=4)  # action(2) + goal_dir(2)
 
     # model
     parser.add_argument("--embed_dim", type=int, default=64)
