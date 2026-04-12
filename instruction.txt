@@ -10,3 +10,9 @@ PID=$!; sleep 30 && kill $PID 2>/dev/null; wait $PID 2>/dev/null; echo "--- done
 
 
 cd /Users/rajneesh/Desktop/my_projects/laworldmodel && source venv/bin/activate && cd self-driving && timeout 30 python drive.py --checkpoint model/checkpoints/driving_jepa_epoch_30.pt --expert-compare 2>&1; echo "--- exit code: $? ---"
+
+
+
+
+
+i
