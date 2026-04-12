@@ -1,12 +1,12 @@
 """
-Model-driven car: the trained JEPA world model navigates through obstacles.
+Model-driven car: imitation learning policy navigates through obstacles.
 
-The model plans by predicting future embeddings for candidate action sequences
-(each conditioned on action + goal_dir) and picks the safest trajectory.
+The policy network directly predicts which action the A* expert would take,
+given the 6x6 FOV and goal direction. FOV obstacle check as safety net.
 
 Usage:
-    python drive.py --checkpoint model/checkpoints/driving_jepa_epoch_30.pt
-    python drive.py --checkpoint model/checkpoints/driving_jepa_epoch_30.pt --expert-compare
+    python drive.py --checkpoint model/checkpoints/policy_best.pt
+    python drive.py --checkpoint model/checkpoints/policy_best.pt --expert-compare
 """
 
 import argparse
@@ -29,14 +29,13 @@ from car_game import (
     CAR_SIZE,
     DISPLAY_W,
     DISPLAY_H,
-    FOV_H,
-    FOV_W,
 )
 from renderer import GameRenderer
+from policy import DrivingPolicy, ACTION_TABLE
 
 GOAL_DIST_MIN = 10
 GOAL_DIST_MAX = 25
-GOAL_REACH_DIST = 3  # Manhattan distance to count as "reached"
+GOAL_REACH_DIST = 3
 
 
 def _random_goal(game, rng):
@@ -56,19 +55,8 @@ def _goal_dir(game, gy, gx):
     return [0.0, 0.0]
 
 
-def load_model(ckpt_path, device):
-    model = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model.eval()
-    model.requires_grad_(False)
-    return model
-
-
 def _fov_danger(fov, ax, ay):
-    """Check if moving (ax, ay) places the car on an obstacle in the FOV.
-
-    Returns number of obstacle cells the car's 2x2 body would overlap.
-    """
-    # car's top-left in FOV is (VISIBILITY, VISIBILITY)
+    """Check if moving (ax, ay) places the car on a visible obstacle."""
     new_r = VISIBILITY + int(ay)
     new_c = VISIBILITY + int(ax)
     danger = 0
@@ -78,75 +66,46 @@ def _fov_danger(fov, ax, ay):
             if 0 <= r < LOCAL_FOV and 0 <= c < LOCAL_FOV:
                 if fov[r, c] < -0.5:
                     danger += 1
-            else:
-                # outside FOV = unknown — small penalty
-                danger += 0.25
     return danger
 
 
-def plan_action(model, fov_np, goal_dir, device, car_y, car_x,
-                visit_counts, horizon=3):
-    """Pick best action: avoid obstacles, maximise goal alignment, don't loop.
+def load_policy(ckpt_path, device):
+    model = DrivingPolicy()
+    model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
+    model.to(device)
+    model.eval()
+    return model
 
-    1. FOV obstacle check (hard safety)
-    2. Goal alignment (direction)
-    3. Full-history anti-loop: penalise cells proportional to visit count
-    4. Model cost as small tiebreaker
-    """
+
+def policy_action(model, fov_np, goal_dir, device, visit_counts, car_y, car_x):
+    """Get action from policy, with FOV safety check and anti-loop."""
     with torch.no_grad():
-        fov = torch.from_numpy(fov_np).float().unsqueeze(0).unsqueeze(0).to(device)
-        info = model.encode({"grid": fov})
-        init_emb = info["emb"]
+        fov_t = torch.from_numpy(fov_np).float().unsqueeze(0).to(device)
+        gd_t = torch.tensor([goal_dir], dtype=torch.float32).to(device)
+        logits = model(fov_t, gd_t)[0].cpu().numpy()  # (8,)
 
-        # 8 candidate actions (no STAY)
-        candidates = []
-        for dx in [-1.0, 0.0, 1.0]:
-            for dy in [-1.0, 0.0, 1.0]:
-                if dx == 0.0 and dy == 0.0:
-                    continue
-                candidates.append([dx, dy])
+    # score each action: policy logit + safety + anti-loop
+    gd = goal_dir
+    best_score = -1e9
+    best_action = ACTION_TABLE[0]
 
-        S = len(candidates)
-        gd = goal_dir
+    for i, (ax, ay) in enumerate(ACTION_TABLE):
+        obs = _fov_danger(fov_np, ax, ay)
+        visits = visit_counts.get((car_y + int(ay), car_x + int(ax)), 0)
 
-        # model cost
-        cond = torch.tensor(
-            [[ax, ay, gd[0], gd[1]] for ax, ay in candidates],
-            dtype=torch.float32,
-        )
-        act_seq = cond.unsqueeze(0).unsqueeze(2).expand(1, S, horizon, 4).to(device)
-        cost = model.plan_cost(init_emb, act_seq, history_size=1)
-        costs_np = cost[0].cpu().numpy()
-        c_min, c_max = costs_np.min(), costs_np.max()
-        costs_norm = (costs_np - c_min) / (c_max - c_min + 1e-6)
+        # policy confidence as base score, penalise obstacles and revisits
+        score = logits[i] - 20.0 * obs - 1.5 * visits
 
-        # score each candidate
-        scores = []
-        for i, (ax, ay) in enumerate(candidates):
-            obs_penalty = _fov_danger(fov_np, ax, ay)
+        if score > best_score:
+            best_score = score
+            best_action = (ax, ay)
 
-            mag = math.sqrt(ax * ax + ay * ay)
-            alignment = (ay * gd[0] + ax * gd[1]) / mag if mag > 0 else 0.0
-
-            # full-history visit penalty — grows with each revisit
-            next_y = car_y + int(ay)
-            next_x = car_x + int(ax)
-            visits = visit_counts.get((next_y, next_x), 0)
-
-            score = (alignment
-                     - 10.0 * obs_penalty
-                     - 2.0 * visits
-                     - 0.1 * costs_norm[i])
-            scores.append(score)
-
-        best_idx = int(np.argmax(scores))
-        return candidates[best_idx], costs_np
+    return best_action
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--horizon", type=int, default=3)
     parser.add_argument("--expert-compare", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -158,14 +117,14 @@ def main():
     )
     print(f"Device: {device}")
     print(f"Loading: {args.checkpoint}")
-    model = load_model(args.checkpoint, device)
+    model = load_policy(args.checkpoint, device)
 
     rng = np.random.default_rng(args.seed)
 
     pygame.init()
     W = DISPLAY_W * 2 + 20 if args.expert_compare else DISPLAY_W
     screen = pygame.display.set_mode((W, DISPLAY_H))
-    title = "Self-Driving — MODEL vs DFS" if args.expert_compare else "Self-Driving — MODEL"
+    title = "Self-Driving — POLICY vs DFS" if args.expert_compare else "Self-Driving — POLICY"
     pygame.display.set_caption(title)
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("monospace", 18, bold=True)
@@ -173,15 +132,15 @@ def main():
 
     renderer = GameRenderer()
 
-    # --- model game ---
+    # --- policy game ---
     game_m = CarGame(seed=args.seed)
     game_m.reset()
     gy, gx = _random_goal(game_m, rng)
     model_trail = []
-    visit_counts = {}  # (y, x) -> count — full history for anti-loop
+    visit_counts = {}
     goals_reached_m = 0
 
-    # --- expert game (same seed = same world) ---
+    # --- expert game ---
     game_e = None
     nav = None
     goals_reached_e = 0
@@ -213,20 +172,19 @@ def main():
                         nav.reset(start_y=game_e.car_y, start_x=game_e.car_x)
                         goals_reached_e = 0
 
-        # --- model drives ---
+        # --- policy drives ---
         fov_m = game_m.get_local_fov()
         gdir = _goal_dir(game_m, gy, gx)
-        (ax_m, ay_m), costs = plan_action(
+        ax_m, ay_m = policy_action(
             model, fov_m, gdir, device,
-            car_y=game_m.car_y, car_x=game_m.car_x,
-            visit_counts=visit_counts, horizon=args.horizon,
+            visit_counts, game_m.car_y, game_m.car_x,
         )
         _, done_m, info_m = game_m.step(ax_m, ay_m)
         pos = (game_m.car_y, game_m.car_x)
         model_trail.append(pos)
         visit_counts[pos] = visit_counts.get(pos, 0) + 1
 
-        # check if model reached goal
+        # check if reached goal
         dist_m = abs(game_m.car_y - gy) + abs(game_m.car_x - gx)
         if dist_m <= GOAL_REACH_DIST:
             goals_reached_m += 1
@@ -250,17 +208,16 @@ def main():
             ax_e, ay_e = nav.next_action(game_e)
             _, done_e, info_e = game_e.step(ax_e, ay_e)
 
-        # ---- draw model view ----
+        # ---- draw policy view ----
         renderer.draw(screen, game_m)
         renderer.draw_goal(screen, game_m, gy, gx, reached=(dist_m <= GOAL_REACH_DIST))
 
-        # draw model trail (last 50 positions)
         if len(model_trail) > 1:
-            renderer.draw_path(screen, game_m, model_trail[-50:], backtracking=False)
+            renderer.draw_path(screen, game_m, model_trail[-80:], backtracking=False)
 
         # HUD
         hud_str = (
-            f" MODEL  Score:{info_m['score']}  Steps:{game_m.steps}"
+            f" POLICY  Score:{info_m['score']}  Steps:{game_m.steps}"
             f"  Goals:{goals_reached_m}  Dist:{dist_m}"
         )
         bar = pygame.Surface((DISPLAY_W, 28), pygame.SRCALPHA)
@@ -272,12 +229,9 @@ def main():
         # FOV preview
         renderer.draw_grid_preview(
             screen, fov_m,
-            x=DISPLAY_W - LOCAL_FOV * 6 - 10,
-            y=32,
-            scale=6,
+            x=DISPLAY_W - LOCAL_FOV * 6 - 10, y=32, scale=6,
         )
 
-        # crash overlay
         if done_m:
             game_num += 1
             overlay = pygame.Surface((DISPLAY_W, DISPLAY_H), pygame.SRCALPHA)
@@ -291,7 +245,7 @@ def main():
             sub = font.render("Press R to restart", True, (220, 220, 220))
             screen.blit(sub, sub.get_rect(center=(DISPLAY_W // 2, DISPLAY_H // 2 + 20)))
 
-            print(f"Game {game_num} | MODEL score:{info_m['score']} goals:{goals_reached_m}", end="")
+            print(f"Game {game_num} | POLICY score:{info_m['score']} goals:{goals_reached_m}", end="")
             if game_e:
                 print(f"  | DFS score:{info_e.get('score', '?')} goals:{goals_reached_e}", end="")
             print()
@@ -303,14 +257,11 @@ def main():
             renderer.draw_visited(expert_surf, game_e, nav.visited)
             renderer.draw_path(expert_surf, game_e, nav.path, backtracking=False)
             renderer.draw_goal(expert_surf, game_e, gy, gx, reached=nav.reached)
-
             screen.blit(expert_surf, (DISPLAY_W + 20, 0))
 
             bar_e = pygame.Surface((DISPLAY_W, 28), pygame.SRCALPHA)
             bar_e.fill((0, 0, 0, 120))
-            expert_surf_hud = pygame.Surface((DISPLAY_W, 28), pygame.SRCALPHA)
-            expert_surf_hud.fill((0, 0, 0, 120))
-            screen.blit(expert_surf_hud, (DISPLAY_W + 20, 0))
+            screen.blit(bar_e, (DISPLAY_W + 20, 0))
             hud_e = font.render(
                 f" DFS  Score:{info_e.get('score', 0)}  Goals:{goals_reached_e}",
                 True, (100, 255, 100),
@@ -323,24 +274,16 @@ def main():
                 nav.reset(start_y=game_e.car_y, start_x=game_e.car_x)
 
         pygame.display.flip()
-        clock.tick(8)
+        clock.tick(10)
 
         if done_m:
-            _wait_for_restart(clock, game_m, game_e, nav, rng)
-            if game_m:
-                model_trail.clear()
-                visit_counts.clear()
-                goals_reached_m = 0
-                gy, gx = _random_goal(game_m, rng)
-                if game_e and nav:
-                    goals_reached_e = 0
-                    nav = DFSNavigator(goal_y=gy, goal_x=gx)
-                    nav.reset(start_y=game_e.car_y, start_x=game_e.car_x)
+            _wait_for_restart(clock, game_m, game_e, nav, rng,
+                              model_trail, visit_counts)
 
     pygame.quit()
 
 
-def _wait_for_restart(clock, game_m, game_e, nav, rng):
+def _wait_for_restart(clock, game_m, game_e, nav, rng, trail, visits):
     while True:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -349,6 +292,8 @@ def _wait_for_restart(clock, game_m, game_e, nav, rng):
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_r:
                     game_m.reset()
+                    trail.clear()
+                    visits.clear()
                     if game_e:
                         game_e.reset()
                     return
