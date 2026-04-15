@@ -152,3 +152,10 @@ Controls: R to restart, Q/ESC to quit.
 | `VISIBILITY`| 2     | Car sees 2 cells from its outline    |
 | `LOCAL_FOV` | 6     | Total FOV grid: 2*2+2 = 6x6         |
 | `CHUNK_SIZE`| 32    | World generated in 32x32 chunks      |
+
+
+
+(venv) rajneesh@Rajneeshs-MacBook-Air game % python play_road.py --auto python drive_road.py --checkpoint model/checkpoints/policy_best.pt
+
+
+python drive_road.py --checkpoint model/checkpoints/policy_best.pt --expert-compare

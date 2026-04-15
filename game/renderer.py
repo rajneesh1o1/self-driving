@@ -67,35 +67,67 @@ class GameRenderer:
 
     def _draw_ground(self, screen, game, fov_top, fov_left):
         cs = CELL_SIZE
+        # If the game exposes is_road(), use it to paint asphalt on the road
+        # and grass off-road. Otherwise just paint grass everywhere.
+        is_road_fn = getattr(game, "is_road", None)
+
         for r in range(FOV_H):
             for c in range(FOV_W):
                 wy = fov_top + r
                 wx = fov_left + c
-                # deterministic per-cell shade
-                h = ((wy * 17 + wx * 31 + 7) % 21) - 10
-                col = (
-                    max(0, min(255, GROUND_BASE[0] + h)),
-                    max(0, min(255, GROUND_BASE[1] + h)),
-                    max(0, min(255, GROUND_BASE[2] + h)),
-                )
-                pygame.draw.rect(screen, col, (c * cs, r * cs, cs, cs))
 
-                # tiny grass tufts (2 per cell, deterministic)
-                seed = (wy * 997 + wx * 313) & 0xFFFFFF
-                for _ in range(2):
-                    gx = c * cs + (seed % (cs - 6)) + 3
-                    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-                    gy = r * cs + (seed % (cs - 6)) + 3
-                    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-                    gl = 3 + seed % 5
-                    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-                    gc = (
-                        max(0, col[0] - 15 + seed % 10),
-                        min(255, col[1] + 5 + seed % 15),
-                        max(0, col[2] - 10 + seed % 8),
+                on_road = bool(is_road_fn(wy, wx)) if is_road_fn else False
+
+                if on_road:
+                    # asphalt shade
+                    h = ((wy * 17 + wx * 31 + 7) % 9) - 4
+                    base = (55, 55, 62)
+                    col = (
+                        max(0, min(255, base[0] + h)),
+                        max(0, min(255, base[1] + h)),
+                        max(0, min(255, base[2] + h)),
                     )
-                    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-                    pygame.draw.line(screen, gc, (gx, gy), (gx, gy - gl), 1)
+                    pygame.draw.rect(screen, col, (c * cs, r * cs, cs, cs))
+                    # lane markings: a short dashed line every 3 cells along y=const
+                    if wy % 4 == 0 and is_road_fn is not None:
+                        cx_road = None
+                        # find road center by sampling a few candidates (cheap)
+                        try:
+                            cx_road = game._road_center_x(wy)
+                        except Exception:
+                            cx_road = None
+                        if cx_road is not None and wx == cx_road:
+                            pygame.draw.rect(
+                                screen, (230, 220, 120),
+                                (c * cs + cs // 2 - 2, r * cs + cs // 4,
+                                 4, cs // 2),
+                            )
+                else:
+                    # grass shade
+                    h = ((wy * 17 + wx * 31 + 7) % 21) - 10
+                    col = (
+                        max(0, min(255, GROUND_BASE[0] + h)),
+                        max(0, min(255, GROUND_BASE[1] + h)),
+                        max(0, min(255, GROUND_BASE[2] + h)),
+                    )
+                    pygame.draw.rect(screen, col, (c * cs, r * cs, cs, cs))
+
+                    # tiny grass tufts (2 per cell, deterministic)
+                    seed = (wy * 997 + wx * 313) & 0xFFFFFF
+                    for _ in range(2):
+                        gx = c * cs + (seed % (cs - 6)) + 3
+                        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+                        gy = r * cs + (seed % (cs - 6)) + 3
+                        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+                        gl = 3 + seed % 5
+                        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+                        gc = (
+                            max(0, col[0] - 15 + seed % 10),
+                            min(255, col[1] + 5 + seed % 15),
+                            max(0, col[2] - 10 + seed % 8),
+                        )
+                        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+                        pygame.draw.line(screen, gc, (gx, gy), (gx, gy - gl), 1)
 
     # ════════════════════════════════════════════════════════════
     #  Obstacles
@@ -103,6 +135,7 @@ class GameRenderer:
 
     def _draw_obstacles(self, screen, game, fov_top, fov_left):
         cs = CELL_SIZE
+        # first pass: static obstacles (trees, containers, walls)
         for r in range(FOV_H):
             for c in range(FOV_W):
                 wy = fov_top + r
@@ -114,8 +147,26 @@ class GameRenderer:
                     ocolor = game.obs_color_at(wy, wx)
                     if otype == 1:
                         self._draw_tree(screen, c * cs, r * cs, ocolor)
+                    elif otype == 5:                       # road-side wall
+                        self._draw_wall(screen, c * cs, r * cs)
+                    elif otype == 6:                       # NPC car (drawn in 2nd pass)
+                        pass
                     else:
                         self._draw_container(screen, c * cs, r * cs, ocolor)
+
+        # second pass: draw NPC cars as whole 2x2 units (if the game has any)
+        npc_fn = getattr(game, "npc_cars", None)
+        if npc_fn is not None:
+            for (ny, nx) in npc_fn():
+                sr = ny - fov_top
+                sc = nx - fov_left
+                if -CAR_SIZE < sr < FOV_H and -CAR_SIZE < sc < FOV_W:
+                    self._draw_npc_car(
+                        screen,
+                        sc * cs, sr * cs,
+                        CAR_SIZE * cs, CAR_SIZE * cs,
+                        color_idx=(ny * 7 + nx * 13) % 5,
+                    )
 
     def _draw_tree(self, screen, x, y, color_idx):
         cs = CELL_SIZE
@@ -157,6 +208,77 @@ class GameRenderer:
         # cross straps
         pygame.draw.line(screen, darker, (bx + 4, by + 4), (bx + bw - 4, by + bh - 4), 2)
         pygame.draw.line(screen, darker, (bx + bw - 4, by + 4), (bx + 4, by + bh - 4), 2)
+
+    def _draw_wall(self, screen, x, y):
+        """Road-side barrier — concrete block with yellow hazard stripe."""
+        cs = CELL_SIZE
+        base = (155, 155, 160)
+        dark = (95, 95, 100)
+        light = (205, 205, 210)
+        # use a per-tile subsurface so stripes can't bleed into neighbours
+        tile = pygame.Surface((cs, cs))
+        tile.fill(dark)
+        pygame.draw.rect(tile, base, (2, 2, cs - 4, cs - 4))
+        # diagonal hazard stripes (drawn on the tile, clipped to it)
+        stripe = (230, 200, 70)
+        for i in range(-cs, cs * 2, 10):
+            pygame.draw.line(tile, stripe, (i, 0), (i + cs, cs), 4)
+        # top bevel
+        pygame.draw.rect(tile, light, (2, 2, cs - 4, 2))
+        pygame.draw.rect(tile, dark, (0, 0, cs, cs), 2)
+        screen.blit(tile, (x, y))
+
+    def _draw_npc_car(self, screen, x, y, w, h, color_idx):
+        """A simpler 'other car' glyph, facing forward (-y)."""
+        palette = [
+            (220, 80, 80),
+            (90, 180, 230),
+            (240, 200, 70),
+            (120, 200, 120),
+            (200, 130, 220),
+        ]
+        body = palette[color_idx % len(palette)]
+        body_dark = tuple(max(0, c - 50) for c in body)
+        body_light = tuple(min(255, c + 40) for c in body)
+
+        # shadow
+        shadow_surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.draw.ellipse(shadow_surf, (0, 0, 0, 60), (4, 4, w - 4, h - 4))
+        screen.blit(shadow_surf, (x + 2, y + 2))
+
+        # wheels
+        ww, wh = 8, 16
+        for wx, wy in [
+            (x + 2, y + 8),
+            (x + w - 10, y + 8),
+            (x + 2, y + h - 24),
+            (x + w - 10, y + h - 24),
+        ]:
+            pygame.draw.rect(screen, (30, 30, 30), (wx, wy, ww, wh), border_radius=3)
+
+        # body
+        bx, by, bw, bh = x + 8, y + 4, w - 16, h - 8
+        pygame.draw.rect(screen, body, (bx, by, bw, bh), border_radius=12)
+        pygame.draw.rect(screen, body_dark, (bx + 2, by + bh // 2, bw - 4, bh // 2 - 2),
+                         border_radius=10)
+
+        # roof
+        rx, ry, rw, rh = bx + 5, by + 12, bw - 10, bh - 24
+        pygame.draw.rect(screen, body_light, (rx, ry, rw, rh), border_radius=6)
+
+        # windshield (front/top) and rear window
+        pygame.draw.rect(screen, (210, 235, 255),
+                         (bx + 6, by + 6, bw - 12, 14), border_radius=5)
+        pygame.draw.rect(screen, (210, 235, 255),
+                         (bx + 8, by + bh - 18, bw - 16, 10), border_radius=4)
+
+        # headlights (front)
+        pygame.draw.circle(screen, (255, 245, 130), (bx + 8, by + 3), 4)
+        pygame.draw.circle(screen, (255, 245, 130), (bx + bw - 8, by + 3), 4)
+
+        # taillights (rear)
+        pygame.draw.circle(screen, (230, 50, 50), (bx + 8, by + bh - 3), 3)
+        pygame.draw.circle(screen, (230, 50, 50), (bx + bw - 8, by + bh - 3), 3)
 
     def _draw_rock(self, screen, x, y, color_idx):
         """Boundary obstacle — simple grey rock."""
